@@ -1,0 +1,12 @@
+import base64
+import functions_framework
+
+@functions_framework.cloud_event
+def send_alert(cloud_event):
+    message_data = cloud_event.data.get("message", {}).get("data")
+    if message_data:
+        message = base64.b64decode(message_data).decode("utf-8")
+        print(f"TELECOM FRAUD ALERT: {message}")
+    else:
+        print("No message received")
+    return "OK"
