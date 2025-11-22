@@ -1,0 +1,184 @@
+
+
+### PHASE 0 – PRE-REQUISITES
+- You are logged in with `zameersaiyed987@gmail.com`
+- Billing is enabled
+- Cloud Shell is open
+
+### PHASE 1 – CREATE PROJECT & ENABLE APIs (CLI)
+```bash
+# Create project
+gcloud projects create telecom-cdr --name="Telecom CDR Pipeline" --set-as-default
+
+# Link billing (replace BILLING_ID with your actual billing account ID)
+gcloud beta billing projects link telecom-cdr --billing-account=YOUR_BILLING_ID
+
+# Set project
+gcloud config set project telecom-cdr
+
+# Enable all required APIs
+gcloud services enable \
+  composer.googleapis.com \
+  dataproc.googleapis.com \
+  bigquery.googleapis.com \
+  storage.googleapis.com \
+  pubsub.googleapis.com \
+  cloudfunctions.googleapis.com \
+  cloudbuild.googleapis.com \
+  artifactregistry.googleapis.com
+```
+
+### PHASE 2 – IAM ROLES TO DEFAULT COMPUTE SA (CONSOLE + CLI)
+Default SA: `300350383516-compute@developer.gserviceaccount.com`
+
+**Console way (recommended):**
+1. Go → https://console.cloud.google.com/iam-admin/iam?project=telecom-cdr
+2. Find the above SA → Edit → Add these roles:
+   - Composer Worker
+   - Dataproc Administrator
+   - Service Account User
+   - Service Account Token Creator
+   - Storage Admin
+   - BigQuery Admin
+   - Pub/Sub Publisher
+   - Cloud Functions Developer
+
+**OR CLI way (copy-paste):**
+```bash
+COMPUTE_SA="300350383516-compute@developer.gserviceaccount.com"
+gcloud projects add-iam-policy-binding telecom-cdr \
+  --member="serviceAccount:$COMPUTE_SA" --role="roles/composer.worker"
+gcloud projects add-iam-policy-binding telecom-cdr \
+  --member="serviceAccount:$COMPUTE_SA" --role="roles/dataproc.admin"
+gcloud projects add-iam-policy-binding telecom-cdr \
+  --member="serviceAccount:$COMPUTE_SA" --role="roles/iam.serviceAccountUser"
+gcloud projects add-iam-policy-binding telecom-cdr \
+  --member="serviceAccount:$COMPUTE_SA" --role="roles/iam.serviceAccountTokenCreator"
+gcloud projects add-iam-policy-binding telecom-cdr \
+  --member="serviceAccount:$COMPUTE_SA" --role="roles/storage.admin"
+gcloud projects add-iam-policy-binding telecom-cdr \
+  --member="serviceAccount:$COMPUTE_SA" --role="roles/bigquery.admin"
+gcloud projects add-iam-policy-binding telecom-cdr \
+  --member="serviceAccount:$COMPUTE_SA" --role="roles/pubsub.publisher"
+```
+
+### PHASE 3 – GCS BUCKET + PYSPARK JOB
+```bash
+# Create bucket
+gsutil mb -l us-central1 gs://telecom-cdr-data
+
+# Create and upload PySpark job
+cat > direct_to_bigquery.py << 'EOF'
+# Your full PySpark job here (you already have this)
+# ... (the one that reads CDR, aggregates, publishes to Pub/Sub if >2GB)
+EOF
+
+gsutil cp direct_to_bigquery.py gs://telecom-cdr-data/
+```
+
+### PHASE 4 – BIGQUERY DATASET & TABLE (CONSOLE OR CLI)
+```bash
+bq mk --dataset telecom-cdr:telecom_usage
+
+bq mk --table \
+  --schema=user_id:STRING,date:DATE,total_gb:FLOAT \
+  --time_partitioning_field=date \
+  telecom-cdr:telecom_usage.daily_usage_summary
+```
+
+### PHASE 5 – PUB/SUB TOPIC
+```bash
+gcloud pubsub topics create high-usage-alerts
+```
+
+### PHASE 6 – CLOUD FUNCTION (FRAUD ALERT)
+```bash
+gcloud functions deploy send-telecom-alert \
+  --region=us-central1 \
+  --trigger-topic=high-usage-alerts \
+  --runtime=python311 \
+  --source=. \
+  --entry-point=send_telecom_alert \
+  --service-account=300350383516-compute@developer.gserviceaccount.com
+```
+
+`main.py` and `requirements.txt` (you already have)
+
+### PHASE 7 – CREATE COMPOSER 3 ENVIRONMENT (CLI)
+```bash
+gcloud composer environments create telecom-composer \
+  --location us-central1 \
+  --image-version composer-3-airflow-2.10.5-build.19 \
+  --environment-size small \
+  --service-account 300350383516-compute@developer.gserviceaccount.com
+```
+
+### PHASE 8 – FINAL WORKING DAG (2025 COMPATIBLE)
+```bash
+mkdir -p ~/dags
+cat > ~/dags/telecom_daily_pipeline.py << 'EOF'
+from airflow import DAG
+from airflow.providers.google.cloud.operators.dataproc import DataprocCreateClusterOperator, DataprocSubmitJobOperator, DataprocDeleteClusterOperator
+from airflow.utils.dates import days_ago
+
+with DAG(
+    "telecom_daily_pipeline",
+    schedule_interval="30 20 * * *",
+    start_date=days_ago(1),
+    catchup=False,
+    default_args={"owner": "Saiyed", "retries": 1},
+    tags=["telecom", "production"],
+) as dag:
+
+    create_cluster = DataprocCreateClusterOperator(
+        task_id="create_cluster",
+        project_id="telecom-cdr",
+        region="us-central1",
+        cluster_name="telecom-cluster-{{ ds_nodash }}",
+        cluster_config={
+            "master_config": {"num_instances": 1, "machine_type_uri": "n2-standard-4"},
+            "worker_config": {"num_instances": 2, "machine_type_uri": "n2-standard-4"},
+        },
+    )
+
+    run_spark = DataprocSubmitJobOperator(
+        task_id="run_spark_job",
+        project_id="telecom-cdr",
+        region="us-central1",
+        job={"placement": {"cluster_name": "telecom-cluster-{{ ds_nodash }}"},
+             "pyspark_job": {"main_python_file_uri": "gs://telecom-cdr-data/direct_to_bigquery.py"}},
+    )
+
+    delete_cluster = DataprocDeleteClusterOperator(
+        task_id="delete_cluster",
+        project_id="telecom-cdr",
+        region="us-central1",
+        cluster_name="telecom-cluster-{{ ds_nodash }}",
+    )
+
+    create_cluster >> run_spark >> delete_cluster
+EOF
+```
+
+### PHASE 9 – UPLOAD DAG TO COMPOSER
+```bash
+gsutil cp ~/dags/telecom_daily_pipeline.py \
+  $(gcloud composer environments describe telecom-composer --location us-central1 --format="value(config.dagGcsPrefix)" --project=telecom-cdr)
+```
+
+### PHASE 10 – FINAL GITHUB PUSH (YOUR REPO)
+```bash
+git clone https://github.com/zameer092/telecom-cdr-data.git
+cd telecom-cdr-data
+# Copy all folders: dags/, spark_jobs/, cloud_functions/, etc.
+git add .
+git commit -m "Full production telecom pipeline – Nov 2025"
+git push origin main   # Use Personal Access Token when asked
+```
+
+**YOUR FINAL LIVE LINKS**
+- GitHub: https://github.com/zameer092/telecom-cdr-data
+- Airflow UI: Open Composer → Click “Airflow” button
+- Fraud Alerts: https://console.cloud.google.com/functions/details/us-central1/send-telecom-alert?project=telecom-cdr&tab=logs
+
+
